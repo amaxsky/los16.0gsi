@@ -287,8 +287,7 @@ bool InputReaderConfiguration::getDisplayViewport(ViewportType viewportType,
         
     // ===== 添加旋转逻辑：强制旋转 90 度 =====
     if (viewportType == ViewportType::VIEWPORT_INTERNAL) {
-       outViewport->orientation = 
-           (DisplayOrientation)((outViewport->orientation + 1) % 4);
+        outViewport->orientation = (outViewport->orientation + 1) % 4;
     }
     // ========================================
     

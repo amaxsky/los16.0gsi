@@ -118,7 +118,7 @@ mkdir -p ~/build-output/
 
 buildVariant() {
 	lunch ${1}-userdebug
-	make installclean
+	make clean
 	make -j$(nproc --all) systemimage
 	make vndk-test-sepolicy
 	mv $OUT/system.img ~/build-output/lineage-16.0-$BUILD_DATE-UNOFFICIAL-${1}.img
