@@ -33,6 +33,20 @@ echo "Setting up build environment"
 source build/envsetup.sh &> /dev/null
 echo ""
 
+echo ">>> Fixing webview.apk (force re-download)..."
+rm -f external/chromium-webview/prebuilt/arm64/webview.apk
+rm -f external/chromium-webview/prebuilt/arm/webview.apk
+
+wget -q -O external/chromium-webview/prebuilt/arm64/webview.apk "https://github.com/LineageOS/android_external_chromium-webview/raw/refs/heads/master/prebuilt/arm64/webview.apk"
+wget -q -O external/chromium-webview/prebuilt/arm/webview.apk "https://github.com/LineageOS/android_external_chromium-webview/raw/refs/heads/master/prebuilt/arm/webview.apk"
+
+echo "Verifying webview.apk..."
+file external/chromium-webview/prebuilt/arm64/webview.apk
+file external/chromium-webview/prebuilt/arm/webview.apk
+ls -la external/chromium-webview/prebuilt/arm64/webview.apk
+ls -la external/chromium-webview/prebuilt/arm/webview.apk
+echo ""
+
 echo ">>> Downloading custom InputReader.cpp..."
 wget -q -O frameworks/native/services/inputflinger/InputReader.cpp https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/InputReader.cpp
 
