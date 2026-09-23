@@ -284,13 +284,6 @@ bool InputReaderConfiguration::getDisplayViewport(ViewportType viewportType,
 
     if (viewport != NULL && viewport->displayId >= 0) {
         *outViewport = *viewport;
-        
-    // ===== 添加旋转逻辑：强制旋转 90 度 =====
-    if (viewportType == ViewportType::VIEWPORT_INTERNAL) {
-        outViewport->orientation = (outViewport->orientation + 1) % 4;
-    }
-    // ========================================
-    
         return true;
     }
     return false;
@@ -3564,6 +3557,13 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
             mDeviceMode = DEVICE_MODE_DISABLED;
             return;
         }
+        
+        // ===== 强制旋转 90 度 =====
+        if (viewportTypeToUse == ViewportType::VIEWPORT_INTERNAL) {
+            newViewport.orientation = (newViewport.orientation + 1) % 4;
+        }
+        // ==========================
+        
     } else {
         newViewport.setNonDisplayViewport(rawWidth, rawHeight);
     }
