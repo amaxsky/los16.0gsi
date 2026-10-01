@@ -3631,8 +3631,7 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
             mSurfaceLeft = naturalPhysicalLeft * naturalLogicalWidth / naturalPhysicalWidth;
             mSurfaceTop = naturalPhysicalTop * naturalLogicalHeight / naturalPhysicalHeight;
 
-            mSurfaceOrientation = mParameters.orientationAware ?
-                    mViewport.orientation : DISPLAY_ORIENTATION_0;
+            mSurfaceOrientation = mViewport.orientation;
         } else {
             mPhysicalWidth = rawWidth;
             mPhysicalHeight = rawHeight;
