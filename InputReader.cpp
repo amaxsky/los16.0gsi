@@ -3603,29 +3603,45 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
                 break;
             case DISPLAY_ORIENTATION_0:
             default:
-                naturalLogicalWidth = mViewport.logicalBottom - mViewport.logicalTop;
-                naturalLogicalHeight = mViewport.logicalRight - mViewport.logicalLeft;
-                naturalPhysicalWidth = mViewport.physicalBottom - mViewport.physicalTop;
-                naturalPhysicalHeight = mViewport.physicalRight - mViewport.physicalLeft;
-                naturalPhysicalLeft = mViewport.deviceHeight - mViewport.physicalBottom;
-                naturalPhysicalTop = mViewport.physicalLeft;
-                naturalDeviceWidth = mViewport.deviceHeight;
-                naturalDeviceHeight = mViewport.deviceWidth;
+                naturalLogicalWidth = mViewport.logicalRight - mViewport.logicalLeft;
+                naturalLogicalHeight = mViewport.logicalBottom - mViewport.logicalTop;
+                naturalPhysicalWidth = mViewport.physicalRight - mViewport.physicalLeft;
+                naturalPhysicalHeight = mViewport.physicalBottom - mViewport.physicalTop;
+                naturalPhysicalLeft = mViewport.physicalLeft;
+                naturalPhysicalTop = mViewport.physicalTop;
+                naturalDeviceWidth = mViewport.deviceWidth;
+                naturalDeviceHeight = mViewport.deviceHeight;
                 break;
             }
+            
+if (mViewport.orientation == DISPLAY_ORIENTATION_0) {
+    // 开机强制横屏：交换宽高
+    mPhysicalWidth = naturalPhysicalHeight;
+    mPhysicalHeight = naturalPhysicalWidth;
+    mPhysicalLeft = naturalPhysicalTop;
+    mPhysicalTop = naturalPhysicalLeft;
 
-            mPhysicalWidth = naturalPhysicalWidth;
-            mPhysicalHeight = naturalPhysicalHeight;
-            mPhysicalLeft = naturalPhysicalLeft;
-            mPhysicalTop = naturalPhysicalTop;
+    mSurfaceWidth = naturalLogicalHeight * naturalDeviceHeight / naturalPhysicalHeight;
+    mSurfaceHeight = naturalLogicalWidth * naturalDeviceWidth / naturalPhysicalWidth;
+    mSurfaceLeft = naturalPhysicalTop * naturalLogicalHeight / naturalPhysicalHeight;
+    mSurfaceTop = naturalPhysicalLeft * naturalLogicalWidth / naturalPhysicalWidth;
 
-            mSurfaceWidth = naturalLogicalWidth * naturalDeviceWidth / naturalPhysicalWidth;
-            mSurfaceHeight = naturalLogicalHeight * naturalDeviceHeight / naturalPhysicalHeight;
-            mSurfaceLeft = naturalPhysicalLeft * naturalLogicalWidth / naturalPhysicalWidth;
-            mSurfaceTop = naturalPhysicalTop * naturalLogicalHeight / naturalPhysicalHeight;
+    mSurfaceOrientation = DISPLAY_ORIENTATION_90;
+} else {
+    mPhysicalWidth = naturalPhysicalWidth;
+    mPhysicalHeight = naturalPhysicalHeight;
+    mPhysicalLeft = naturalPhysicalLeft;
+    mPhysicalTop = naturalPhysicalTop;
 
-            mSurfaceOrientation = mParameters.orientationAware ?
-                    mViewport.orientation : DISPLAY_ORIENTATION_0;
+    mSurfaceWidth = naturalLogicalWidth * naturalDeviceWidth / naturalPhysicalWidth;
+    mSurfaceHeight = naturalLogicalHeight * naturalDeviceHeight / naturalPhysicalHeight;
+    mSurfaceLeft = naturalPhysicalLeft * naturalLogicalWidth / naturalPhysicalWidth;
+    mSurfaceTop = naturalPhysicalTop * naturalLogicalHeight / naturalPhysicalHeight;
+
+    mSurfaceOrientation = mParameters.orientationAware ?
+            mViewport.orientation : DISPLAY_ORIENTATION_0;
+}            
+
         } else {
             mPhysicalWidth = rawWidth;
             mPhysicalHeight = rawHeight;
@@ -3869,20 +3885,20 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
             break;
 
         default:
-               mOrientedXPrecision = mYPrecision;
-            mOrientedYPrecision = mXPrecision;
+            mOrientedXPrecision = mXPrecision;
+            mOrientedYPrecision = mYPrecision;
 
-            mOrientedRanges.x.min = mYTranslate;
-            mOrientedRanges.x.max = mSurfaceHeight + mYTranslate - 1;
+            mOrientedRanges.x.min = mXTranslate;
+            mOrientedRanges.x.max = mSurfaceWidth + mXTranslate - 1;
             mOrientedRanges.x.flat = 0;
             mOrientedRanges.x.fuzz = 0;
-            mOrientedRanges.x.resolution = mRawPointerAxes.y.resolution * mYScale;
+            mOrientedRanges.x.resolution = mRawPointerAxes.x.resolution * mXScale;
 
-            mOrientedRanges.y.min = mXTranslate;
-            mOrientedRanges.y.max = mSurfaceWidth + mXTranslate - 1;
+            mOrientedRanges.y.min = mYTranslate;
+            mOrientedRanges.y.max = mSurfaceHeight + mYTranslate - 1;
             mOrientedRanges.y.flat = 0;
             mOrientedRanges.y.fuzz = 0;
-            mOrientedRanges.y.resolution = mRawPointerAxes.x.resolution * mXScale;
+            mOrientedRanges.y.resolution = mRawPointerAxes.y.resolution * mYScale;
             break;
         }
 
@@ -5174,16 +5190,12 @@ void TouchInputMapper::cookPointerData() {
             }
             break;
         default:
-            x = float(yTransformed - mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
-            y = float(mRawPointerAxes.x.maxValue - xTransformed) * mXScale + mXTranslate;
-            left = float(rawTop - mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
-            right = float(rawBottom- mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
-            bottom = float(mRawPointerAxes.x.maxValue - rawLeft) * mXScale + mXTranslate;
-            top = float(mRawPointerAxes.x.maxValue - rawRight) * mXScale + mXTranslate;
-            orientation -= M_PI_2;
-            if (mOrientedRanges.haveOrientation && orientation < mOrientedRanges.orientation.min) {
-                orientation += (mOrientedRanges.orientation.max - mOrientedRanges.orientation.min);
-            }
+            x = float(xTransformed - mRawPointerAxes.x.minValue) * mXScale + mXTranslate;
+            y = float(yTransformed - mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
+            left = float(rawLeft - mRawPointerAxes.x.minValue) * mXScale + mXTranslate;
+            right = float(rawRight - mRawPointerAxes.x.minValue) * mXScale + mXTranslate;
+            bottom = float(rawBottom - mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
+            top = float(rawTop - mRawPointerAxes.y.minValue) * mYScale + mYTranslate;
             break;
         }
 
