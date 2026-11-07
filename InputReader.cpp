@@ -3557,6 +3557,14 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
             mDeviceMode = DEVICE_MODE_DISABLED;
             return;
         }
+        
+        // ===== 强制旋转 90 度 =====
+    if (viewportTypeToUse == ViewportType::VIEWPORT_INTERNAL) {
+        newViewport.orientation = (newViewport.orientation + 1) % 4;
+    }
+    // ==========================
+
+
     } else {
         newViewport.setNonDisplayViewport(rawWidth, rawHeight);
     }
@@ -3613,8 +3621,8 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
                 naturalDeviceHeight = mViewport.deviceHeight;
                 break;
             }
-            
-if (mViewport.orientation == DISPLAY_ORIENTATION_0) {
+
+            if (mViewport.orientation == DISPLAY_ORIENTATION_0) {
     // 开机强制横屏：交换宽高
     mPhysicalWidth = naturalPhysicalHeight;
     mPhysicalHeight = naturalPhysicalWidth;
@@ -3640,8 +3648,7 @@ if (mViewport.orientation == DISPLAY_ORIENTATION_0) {
 
     mSurfaceOrientation = mParameters.orientationAware ?
             mViewport.orientation : DISPLAY_ORIENTATION_0;
-}            
-
+}
         } else {
             mPhysicalWidth = rawWidth;
             mPhysicalHeight = rawHeight;
