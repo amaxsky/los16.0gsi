@@ -47,25 +47,7 @@ ls -la external/chromium-webview/prebuilt/arm64/webview.apk
 ls -la external/chromium-webview/prebuilt/arm/webview.apk
 echo ""
 
-echo ">>> Downloading custom InputReader.cpp..."
-wget -q -O frameworks/native/services/inputflinger/InputReader.cpp https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/InputReader.cpp
 
-if [ -s frameworks/native/services/inputflinger/InputReader.cpp ]; then
-    echo "InputReader.cpp replaced successfully"
-else
-    echo "WARNING: InputReader.cpp download failed or empty!"
-fi
-
-echo ''
-echo '>>> Displaying inputflinger directory contents...'
-ls -la frameworks/native/services/inputflinger/
-echo ''
-echo '>>> File size check:'
-wc -l frameworks/native/services/inputflinger/InputReader.cpp
-echo ''
-echo '>>> First 10 lines of InputReader.cpp:'
-head -10 frameworks/native/services/inputflinger/InputReader.cpp
-echo ''
 
 echo "Applying PHH patches"
 cd frameworks/base
@@ -126,6 +108,28 @@ echo "All patches applied (failures skipped)"
 sleep 5
 echo ""
 
+# ... 所有补丁应用之后 ...
+
+echo ">>> Downloading custom InputReader.cpp..."
+wget -q -O frameworks/native/services/inputflinger/InputReader.cpp https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/InputReader.cpp
+
+if [ -s frameworks/native/services/inputflinger/InputReader.cpp ]; then
+    echo "InputReader.cpp replaced successfully"
+else
+    echo "WARNING: InputReader.cpp download failed or empty!"
+fi
+
+echo ''
+echo '>>> Displaying inputflinger directory contents...'
+ls -la frameworks/native/services/inputflinger/
+echo ''
+echo '>>> File size check:'
+wc -l frameworks/native/services/inputflinger/InputReader.cpp
+echo ''
+echo '>>> First 10 lines of InputReader.cpp:'
+head -10 frameworks/native/services/inputflinger/InputReader.cpp
+echo ''
+# 然后编译
 export WITHOUT_CHECK_API=true
 export WITH_SU=true
 mkdir -p ~/build-output/
