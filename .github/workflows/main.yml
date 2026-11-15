@@ -1,0 +1,193 @@
+name: LineageOS 16.0 GSI Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      BUILD_VARIANT:
+        description: '选择要编译的 GSI 变体:'
+        required: true
+        default: 'arm64_bvN'
+        type: choice
+        options:
+          - 'arm_avN'
+          - 'arm_bvN'
+          - 'a64_avN'
+          - 'a64_bvN'
+          - 'arm64_avN'
+          - 'arm64_bvN'
+      CLEAN_BUILD:
+        description: '强制全新编译?'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+
+jobs:
+  build:
+    name: 编译 LineageOS 16.0 GSI（目标 so 生成后停止）
+    # ⚠️ 换成你的大 runner（≥16核 / ≥32GB 内存 / ≥200GB 磁盘）
+    runs-on: [self-hosted, linux, x64, big]
+    timeout-minutes: 1440
+    concurrency:
+      group: ${{ github.actor }}-${{ github.event.inputs.BUILD_VARIANT }}
+      cancel-in-progress: false
+
+    steps:
+      - name: 编译信息
+        run: |
+          echo "变体: ${{ github.event.inputs.BUILD_VARIANT }}"
+          echo "全新编译: ${{ github.event.inputs.CLEAN_BUILD }}"
+          df -h
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
+            rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+            python2 python3 openjdk-8-jdk openjdk-11-jdk unzip wget aria2 jq
+
+      - name: 安装 repo
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+
+      - name: 编译（监控产物，达标即停）
+        env:
+          BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
+          CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
+          # 判定阈值：lib*.so 数量达到此值认为 lib/lib64 基本编完，可按实际调整
+          LIB_SO_THRESHOLD: '200'
+          # 轮询间隔（秒）
+          POLL_INTERVAL: '30'
+        run: |
+          set -e
+
+          # ===== 按官方流程准备 =====
+          cd ~
+          rm -rf ~/treble_experimentations
+          git clone https://github.com/AndyCGYan/treble_experimentations
+
+          rm -rf ~/lineage-16.x-build-gsi
+          mkdir -p ~/lineage-16.x-build-gsi
+          cd ~/lineage-16.x-build-gsi
+
+          repo init -u https://github.com/LineageOS/android.git -b lineage-16.0
+          git clone https://github.com/AndyCGYan/treble_patches treble_patches -b lineage-16.0
+          git clone https://github.com/AndyCGYan/treble_build_los treble_build_los -b lineage-16.0
+
+          # 替换 buildbot 脚本
+          wget -q -O treble_build_los/buildbot_treble.sh \
+            https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/buildbot_treble.sh
+          chmod +x treble_build_los/buildbot_treble.sh
+          echo ">>> buildbot_treble.sh 前 10 行:"
+          head -10 treble_build_los/buildbot_treble.sh
+
+          export BUILD_USERNAME=azure
+          export BUILD_HOSTNAME=github
+
+          # ===== 后台启动编译（独立进程组，便于整组 kill）=====
+          LOG="$HOME/lineage-16.x-build-gsi/build.log"
+          setsid bash -c "cd '$HOME/lineage-16.x-build-gsi' && bash treble_build_los/buildbot_treble.sh ${CLEAN_FLAG}" \
+            > "$LOG" 2>&1 &
+          BUILD_PID=$!
+          echo "buildbot PID: $BUILD_PID，日志: $LOG"
+
+          DEADLINE=$(( $(date +%s) + 1380*60 ))   # 23 小时，留余量
+
+          echo ">>> 开始监控产物..."
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            OUT_DIR=$(find "$HOME/lineage-16.x-build-gsi/out/target/product" \
+                        -maxdepth 1 -type d -name 'lineage_*' 2>/dev/null | head -1)
+
+            if [ -n "$OUT_DIR" ]; then
+              # InputReader 所在库（libinputflinger / libinputreader）
+              INPUTREADER_SO=$(find "$OUT_DIR" -path '*/lib*' \
+                                \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) \
+                                2>/dev/null | wc -l)
+
+              # libinput*.so 总数
+              LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
+
+              # lib*.so 总数（lib / lib64）
+              LIB_COUNT=$(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) \
+                            -name 'lib*.so' 2>/dev/null | wc -l)
+
+              echo "[$(date +%T)] InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  lib*.so=$LIB_COUNT"
+
+              if [ "$INPUTREADER_SO" -ge 1 ] && [ "$LIBINPUT_COUNT" -ge 3 ] \
+                 && [ "$LIB_COUNT" -ge "${LIB_SO_THRESHOLD}" ]; then
+                echo ">>> 目标 .so 已全部生成，终止编译进程组..."
+                kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
+                sleep 10
+                kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+                break
+              fi
+            else
+              echo "[$(date +%T)] 等待 out 目录生成..."
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo ">>> 监控超时，强制终止编译"
+              kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+              break
+            fi
+
+            sleep "${POLL_INTERVAL}"
+          done
+
+          wait "$BUILD_PID" 2>/dev/null || true
+
+          echo ">>> 编译进程已结束，日志尾部："
+          tail -80 "$LOG" || true
+
+          echo ">>> 最终产物统计："
+          OUT_DIR=$(find "$HOME/lineage-16.x-build-gsi/out/target/product" \
+                      -maxdepth 1 -type d -name 'lineage_*' 2>/dev/null | head -1)
+          if [ -n "$OUT_DIR" ]; then
+            echo "out 目录: $OUT_DIR"
+            echo "libinput*.so:"
+            find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #'
+            echo "lib*.so 总数: $(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) -name 'lib*.so' 2>/dev/null | wc -l)"
+            echo "libinputflinger/libinputreader:"
+            find "$OUT_DIR" -path '*/lib*' \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) 2>/dev/null | sed 's#^#  #'
+          else
+            echo "未找到 out 目录"
+          fi
+
+      - name: 上传编译日志
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_id }}
+          path: |
+            ~/lineage-16.x-build-gsi/build.log
+            ~/lineage-16.x-build-gsi/out/error.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 上传目标 .so 产物
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-sos-${{ github.run_id }}
+          path: |
+            ~/lineage-16.x-build-gsi/out/target/product/*/system/lib/*.so
+            ~/lineage-16.x-build-gsi/out/target/product/*/system/lib64/*.so
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
