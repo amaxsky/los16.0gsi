@@ -89,12 +89,13 @@ jobs:
           git config --global user.name "${{ github.actor }}"
           git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-      - name: 编译（监控产物，达标即停）
+      - name: 编译（libinput*.so 全部生成且稳定 5 分钟后停止）
         env:
           BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
-          LIB_SO_THRESHOLD: '200'
-          POLL_INTERVAL: '30'
+          POLL_INTERVAL: '30'        # 轮询间隔（秒）
+          STABLE_SECONDS: '300'      # libinput*.so 数量稳定多久判定"全部生成完"（5 分钟）
+          STALL_SECONDS: '600'       # build.log 超过多久没更新判定卡死（10 分钟）
         run: |
           set -e
 
@@ -135,35 +136,79 @@ jobs:
           echo "buildbot PID: $BUILD_PID，日志: $LOG"
 
           DEADLINE=$(( $(date +%s) + 1380*60 ))
+          OUT_BASE="$HOME/lineage-16.x-build-gsi/out"
 
-          echo ">>> 开始监控产物..."
+          # 稳定判定状态
+          LAST_LIBINPUT_COUNT=-1
+          LAST_CHANGE_TS=$(date +%s)
+          INPUTREADER_SEEN=0
+
+          echo ">>> 开始监控产物（libinput*.so 稳定 ${STABLE_SECONDS}s 后停止）..."
           while kill -0 "$BUILD_PID" 2>/dev/null; do
-            OUT_DIR=$(find "$HOME/lineage-16.x-build-gsi/out/target/product" \
-                        -maxdepth 1 -type d -name 'lineage_*' 2>/dev/null | head -1)
+            NOW=$(date +%s)
+
+            # 1) 致命错误检测
+            if grep -qE 'ninja: build stopped|ninja failed with|!!! An error happened|SyntaxError|No space left on device|fatal: ' "$LOG" 2>/dev/null; then
+              echo ">>> 日志中发现致命错误，终止编译进程组..."
+              kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
+              sleep 5
+              kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+              break
+            fi
+
+            # 2) 日志停滞检测
+            LOG_MTIME=$(stat -c %Y "$LOG" 2>/dev/null || echo "$NOW")
+            if [ $((NOW - LOG_MTIME)) -ge "$STALL_SECONDS" ]; then
+              echo ">>> build.log 已 $((NOW - LOG_MTIME))s 未更新，判定卡死"
+              echo "--- 最后 30 行日志 ---"
+              tail -30 "$LOG" || true
+              echo "--- 相关进程 ---"
+              ps aux | grep -E 'repo|buildbot|git|make|ninja|soong' | grep -v grep || true
+              echo ">>> 终止编译进程组..."
+              kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
+              sleep 5
+              kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+              break
+            fi
+
+            # 3) 统计 libinput*.so / InputReader 库
+            OUT_DIR=""
+            if [ -d "$OUT_BASE/target/product" ]; then
+              OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+            fi
 
             if [ -n "$OUT_DIR" ]; then
               INPUTREADER_SO=$(find "$OUT_DIR" -path '*/lib*' \
                                 \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) \
                                 2>/dev/null | wc -l)
               LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
-              LIB_COUNT=$(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) \
-                            -name 'lib*.so' 2>/dev/null | wc -l)
-
-              echo "[$(date +%T)] InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  lib*.so=$LIB_COUNT"
               AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
-              echo "  可用磁盘: ${AVAIL} MB"
 
-              if [ "$INPUTREADER_SO" -ge 1 ] && [ "$LIBINPUT_COUNT" -ge 3 ] \
-                 && [ "$LIB_COUNT" -ge "${LIB_SO_THRESHOLD}" ]; then
-                echo ">>> 目标 .so 已全部生成，终止编译进程组..."
-                kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
-                sleep 10
-                kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
-                break
+              if [ "$INPUTREADER_SO" -ge 1 ]; then
+                INPUTREADER_SEEN=1
+              fi
+
+              # 数量变化则重置稳定计时
+              if [ "$LIBINPUT_COUNT" -ne "$LAST_LIBINPUT_COUNT" ]; then
+                LAST_LIBINPUT_COUNT=$LIBINPUT_COUNT
+                LAST_CHANGE_TS=$NOW
+                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (数量变化，重置稳定计时)  磁盘=${AVAIL}MB"
+              else
+                STABLE_FOR=$((NOW - LAST_CHANGE_TS))
+                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  磁盘=${AVAIL}MB"
+
+                # 判定：InputReader 库已出现 且 libinput*.so 数量稳定满 5 分钟
+                if [ "$INPUTREADER_SEEN" -eq 1 ] && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
+                  echo ">>> libinput*.so 已全部生成并稳定 ${STABLE_FOR}s，终止编译进程组..."
+                  kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
+                  sleep 10
+                  kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+                  break
+                fi
               fi
             else
-              echo "[$(date +%T)] 等待 out 目录生成..."
-              df -h / | tail -1
+              AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
+              echo "[$(date +%T)] 等待 out/target/product 生成...  磁盘剩余=${AVAIL}MB"
             fi
 
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
@@ -178,16 +223,17 @@ jobs:
           wait "$BUILD_PID" 2>/dev/null || true
 
           echo ">>> 编译进程已结束，日志尾部："
-          tail -80 "$LOG" || true
+          tail -100 "$LOG" || true
 
           echo ">>> 最终产物统计："
-          OUT_DIR=$(find "$HOME/lineage-16.x-build-gsi/out/target/product" \
-                      -maxdepth 1 -type d -name 'lineage_*' 2>/dev/null | head -1)
+          OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
           if [ -n "$OUT_DIR" ]; then
             echo "out 目录: $OUT_DIR"
-            echo "libinput*.so:"
+            echo "libinput*.so 清单:"
             find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #'
-            echo "lib*.so 总数: $(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) -name 'lib*.so' 2>/dev/null | wc -l)"
+            echo "libinput*.so 总数: $(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)"
+            echo "InputReader 库:"
+            find "$OUT_DIR" -path '*/lib*' \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) 2>/dev/null | sed 's#^#  #'
           else
             echo "未找到 out 目录"
           fi
