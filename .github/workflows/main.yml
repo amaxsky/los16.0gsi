@@ -53,19 +53,10 @@ jobs:
             /usr/local/.ghcup /opt/microsoft /usr/local/aws-cli || true
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
-          # 关闭 swap 压缩、清缓存
           sudo swapoff -a || true
           echo "::group::清理后"
           df -h
           echo "::endgroup::"
-
-      - name: 增加 swap（缓解 7GB 内存 OOM）
-        run: |
-          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
 
       - name: 安装依赖
         run: |
@@ -77,6 +68,14 @@ jobs:
             libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
             rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
             python2 python3 openjdk-8-jdk openjdk-11-jdk unzip wget aria2 jq
+
+      - name: 强制 python 指向 python2（AOSP 16 必需）
+        run: |
+          mkdir -p ~/.local/bin
+          ln -sf /usr/bin/python2 ~/.local/bin/python
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          /usr/bin/python2 --version
+          ls -la ~/.local/bin/python
 
       - name: 安装 repo
         run: |
@@ -98,6 +97,11 @@ jobs:
           POLL_INTERVAL: '30'
         run: |
           set -e
+
+          export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+          echo ">>> python 版本检查:"
+          which python
+          python --version
 
           # ===== 官方流程准备 =====
           cd ~
@@ -121,12 +125,11 @@ jobs:
 
           export BUILD_USERNAME=azure
           export BUILD_HOSTNAME=github
-          # 普通 runner 内存小，限制并行度
           export J_VAL=$(nproc)
 
           # ===== 后台启动编译 =====
           LOG="$HOME/lineage-16.x-build-gsi/build.log"
-          setsid bash -c "cd '$HOME/lineage-16.x-build-gsi' && bash treble_build_los/buildbot_treble.sh ${CLEAN_FLAG}" \
+          setsid bash -c "export PATH='$HOME/.local/bin:$HOME/bin:$PATH'; cd '$HOME/lineage-16.x-build-gsi' && bash treble_build_los/buildbot_treble.sh ${CLEAN_FLAG}" \
             > "$LOG" 2>&1 &
           BUILD_PID=$!
           echo "buildbot PID: $BUILD_PID，日志: $LOG"
@@ -147,7 +150,6 @@ jobs:
                             -name 'lib*.so' 2>/dev/null | wc -l)
 
               echo "[$(date +%T)] InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  lib*.so=$LIB_COUNT"
-              # 磁盘不足预警
               AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
               echo "  可用磁盘: ${AVAIL} MB"
 
