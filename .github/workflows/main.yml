@@ -27,7 +27,7 @@ on:
 jobs:
   build:
     name: 编译 LineageOS 16.0 GSI（普通 runner）
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 1440
     concurrency:
       group: ${{ github.actor }}-${{ github.event.inputs.BUILD_VARIANT }}
