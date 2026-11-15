@@ -26,9 +26,8 @@ on:
 
 jobs:
   build:
-    name: 编译 LineageOS 16.0 GSI（目标 so 生成后停止）
-    # ⚠️ 换成你的大 runner（≥16核 / ≥32GB 内存 / ≥200GB 磁盘）
-    runs-on: [self-hosted, linux, x64, big]
+    name: 编译 LineageOS 16.0 GSI（普通 runner）
+    runs-on: ubuntu-latest
     timeout-minutes: 1440
     concurrency:
       group: ${{ github.actor }}-${{ github.event.inputs.BUILD_VARIANT }}
@@ -39,7 +38,34 @@ jobs:
         run: |
           echo "变体: ${{ github.event.inputs.BUILD_VARIANT }}"
           echo "全新编译: ${{ github.event.inputs.CLEAN_BUILD }}"
+          nproc
+          free -h
           df -h
+
+      - name: 最大化释放磁盘空间
+        run: |
+          echo "::group::清理前"
+          df -h
+          echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+            /opt/google/chrome /usr/local/share/chromium /usr/share/swift \
+            /usr/local/.ghcup /opt/microsoft /usr/local/aws-cli || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # 关闭 swap 压缩、清缓存
+          sudo swapoff -a || true
+          echo "::group::清理后"
+          df -h
+          echo "::endgroup::"
+
+      - name: 增加 swap（缓解 7GB 内存 OOM）
+        run: |
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
 
       - name: 安装依赖
         run: |
@@ -68,14 +94,12 @@ jobs:
         env:
           BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
-          # 判定阈值：lib*.so 数量达到此值认为 lib/lib64 基本编完，可按实际调整
           LIB_SO_THRESHOLD: '200'
-          # 轮询间隔（秒）
           POLL_INTERVAL: '30'
         run: |
           set -e
 
-          # ===== 按官方流程准备 =====
+          # ===== 官方流程准备 =====
           cd ~
           rm -rf ~/treble_experimentations
           git clone https://github.com/AndyCGYan/treble_experimentations
@@ -97,15 +121,17 @@ jobs:
 
           export BUILD_USERNAME=azure
           export BUILD_HOSTNAME=github
+          # 普通 runner 内存小，限制并行度
+          export J_VAL=$(nproc)
 
-          # ===== 后台启动编译（独立进程组，便于整组 kill）=====
+          # ===== 后台启动编译 =====
           LOG="$HOME/lineage-16.x-build-gsi/build.log"
           setsid bash -c "cd '$HOME/lineage-16.x-build-gsi' && bash treble_build_los/buildbot_treble.sh ${CLEAN_FLAG}" \
             > "$LOG" 2>&1 &
           BUILD_PID=$!
           echo "buildbot PID: $BUILD_PID，日志: $LOG"
 
-          DEADLINE=$(( $(date +%s) + 1380*60 ))   # 23 小时，留余量
+          DEADLINE=$(( $(date +%s) + 1380*60 ))
 
           echo ">>> 开始监控产物..."
           while kill -0 "$BUILD_PID" 2>/dev/null; do
@@ -113,19 +139,17 @@ jobs:
                         -maxdepth 1 -type d -name 'lineage_*' 2>/dev/null | head -1)
 
             if [ -n "$OUT_DIR" ]; then
-              # InputReader 所在库（libinputflinger / libinputreader）
               INPUTREADER_SO=$(find "$OUT_DIR" -path '*/lib*' \
                                 \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) \
                                 2>/dev/null | wc -l)
-
-              # libinput*.so 总数
               LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
-
-              # lib*.so 总数（lib / lib64）
               LIB_COUNT=$(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) \
                             -name 'lib*.so' 2>/dev/null | wc -l)
 
               echo "[$(date +%T)] InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  lib*.so=$LIB_COUNT"
+              # 磁盘不足预警
+              AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
+              echo "  可用磁盘: ${AVAIL} MB"
 
               if [ "$INPUTREADER_SO" -ge 1 ] && [ "$LIBINPUT_COUNT" -ge 3 ] \
                  && [ "$LIB_COUNT" -ge "${LIB_SO_THRESHOLD}" ]; then
@@ -137,6 +161,7 @@ jobs:
               fi
             else
               echo "[$(date +%T)] 等待 out 目录生成..."
+              df -h / | tail -1
             fi
 
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
@@ -161,8 +186,6 @@ jobs:
             echo "libinput*.so:"
             find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #'
             echo "lib*.so 总数: $(find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' \) -name 'lib*.so' 2>/dev/null | wc -l)"
-            echo "libinputflinger/libinputreader:"
-            find "$OUT_DIR" -path '*/lib*' \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) 2>/dev/null | sed 's#^#  #'
           else
             echo "未找到 out 目录"
           fi
@@ -178,16 +201,3 @@ jobs:
             ~/lineage-16.x-build-gsi/out/error.log
           if-no-files-found: warn
           retention-days: 7
-
-      - name: 上传目标 .so 产物
-        if: ${{ always() }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-sos-${{ github.run_id }}
-          path: |
-            ~/lineage-16.x-build-gsi/out/target/product/*/system/lib/*.so
-            ~/lineage-16.x-build-gsi/out/target/product/*/system/lib64/*.so
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
