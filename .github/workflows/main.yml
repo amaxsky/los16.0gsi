@@ -44,9 +44,6 @@ jobs:
 
       - name: 最大化释放磁盘空间
         run: |
-          echo "::group::清理前"
-          df -h
-          echo "::endgroup::"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
             /opt/google/chrome /usr/local/share/chromium /usr/share/swift \
@@ -54,9 +51,7 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
           sudo swapoff -a || true
-          echo "::group::清理后"
           df -h
-          echo "::endgroup::"
 
       - name: 安装依赖
         run: |
@@ -75,7 +70,6 @@ jobs:
           ln -sf /usr/bin/python2 ~/.local/bin/python
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           /usr/bin/python2 --version
-          ls -la ~/.local/bin/python
 
       - name: 安装 repo
         run: |
@@ -89,13 +83,14 @@ jobs:
           git config --global user.name "${{ github.actor }}"
           git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-      - name: 编译（libinput*.so 全部生成且稳定 5 分钟后停止）
+      - name: 编译（发现新 libinput*.so 即暂存并打印目录内容）
         env:
           BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
-          POLL_INTERVAL: '30'        # 轮询间隔（秒）
-          STABLE_SECONDS: '300'      # libinput*.so 数量稳定多久判定"全部生成完"（5 分钟）
-          STALL_SECONDS: '1800'      # 日志停滞且无活跃进程多久判定卡死（30 分钟，保守）
+          POLL_INTERVAL: '30'
+          STABLE_SECONDS: '300'
+          STALL_SECONDS: '1800'
+          DISK_MIN_PERCENT: '5'
         run: |
           set -e
 
@@ -117,7 +112,6 @@ jobs:
           git clone https://github.com/AndyCGYan/treble_patches treble_patches -b lineage-16.0
           git clone https://github.com/AndyCGYan/treble_build_los treble_build_los -b lineage-16.0
 
-          # 替换 buildbot 脚本
           wget -q -O treble_build_los/buildbot_treble.sh \
             https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/buildbot_treble.sh
           chmod +x treble_build_los/buildbot_treble.sh
@@ -127,6 +121,17 @@ jobs:
           export BUILD_USERNAME=azure
           export BUILD_HOSTNAME=github
           export J_VAL=$(nproc)
+
+          # ===== staging / 记录 =====
+          STAGING="$GITHUB_WORKSPACE/upload/libinput"
+          MANIFEST="$GITHUB_WORKSPACE/upload/MANIFEST.txt"
+          DIRLIST="$GITHUB_WORKSPACE/upload/DIRLIST.txt"
+          mkdir -p "$STAGING"
+          : > "$MANIFEST"
+          : > "$DIRLIST"
+          echo "STAGING=$STAGING" >> "$GITHUB_ENV"
+          echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
+          echo "DIRLIST=$DIRLIST" >> "$GITHUB_ENV"
 
           # ===== 后台启动编译 =====
           LOG="$HOME/lineage-16.x-build-gsi/build.log"
@@ -140,68 +145,117 @@ jobs:
 
           LAST_LIBINPUT_COUNT=-1
           LAST_CHANGE_TS=$(date +%s)
-          INPUTREADER_SEEN=0
+          STOP_REASON=""
+          SEEN_FILES="$GITHUB_WORKSPACE/upload/seen.txt"
+          : > "$SEEN_FILES"
+          echo "SEEN_FILES=$SEEN_FILES" >> "$GITHUB_ENV"
 
-          echo ">>> 开始监控产物（libinput*.so 稳定 ${STABLE_SECONDS}s 后停止）..."
+          echo ">>> 开始监控产物..."
           while kill -0 "$BUILD_PID" 2>/dev/null; do
             NOW=$(date +%s)
 
-            # 1) 致命错误检测
+            # 1) 致命错误
             if grep -qE 'ninja: build stopped|ninja failed with|!!! An error happened|SyntaxError|No space left on device|fatal: ' "$LOG" 2>/dev/null; then
               echo ">>> 日志中发现致命错误，终止编译进程组..."
+              STOP_REASON="fatal_error"
               kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
               sleep 5
               kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
               break
             fi
 
-            # 2) 卡死检测：日志停滞 且 无活跃编译进程
+            # 2) 磁盘 < 5% 兜底
+            DISK_PCT=$(df --output=pcent / | tail -1 | tr -d ' %')
+            DISK_AVAIL_PCT=$((100 - DISK_PCT))
+            if [ "$DISK_AVAIL_PCT" -lt "$DISK_MIN_PERCENT" ]; then
+              echo ">>> 磁盘剩余 ${DISK_AVAIL_PCT}% < ${DISK_MIN_PERCENT}%，兜底停止"
+              STOP_REASON="disk_low"
+              kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
+              sleep 10
+              kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
+              break
+            fi
+
+            # 3) 卡死检测
             LOG_MTIME=$(stat -c %Y "$LOG" 2>/dev/null || echo "$NOW")
             LOG_STALL=$((NOW - LOG_MTIME))
-
             ACTIVE_PROCS=$(ps -eo pcpu,comm --no-headers 2>/dev/null | \
               awk '$1 > 1 && $2 ~ /^(git|repo|make|ninja|soong_ui|python|python2|python3|clang|clang\+\+|cc1|cc1plus|ld|ld\.lld|java|javac|aapt2|d8|r8|gcc|g\+\+)$/ {c++} END {print c+0}')
-
             if [ "$LOG_STALL" -ge "$STALL_SECONDS" ] && [ "$ACTIVE_PROCS" -eq 0 ]; then
-              echo ">>> build.log 已 ${LOG_STALL}s 未更新，且无活跃编译进程，判定卡死"
-              echo "--- 最后 30 行日志 ---"
+              echo ">>> build.log 已 ${LOG_STALL}s 未更新且无活跃进程，判定卡死"
               tail -30 "$LOG" || true
-              echo "--- 相关进程 ---"
-              ps aux | grep -E 'repo|buildbot|git|make|ninja|soong' | grep -v grep || true
-              echo ">>> 终止编译进程组..."
+              STOP_REASON="stall"
               kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
               sleep 5
               kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
               break
             fi
 
-            # 3) 统计 libinput*.so / InputReader 库
+            # 4) 扫描 libinput*.so
             OUT_DIR=""
             if [ -d "$OUT_BASE/target/product" ]; then
               OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
             fi
 
             if [ -n "$OUT_DIR" ]; then
-              INPUTREADER_SO=$(find "$OUT_DIR" -path '*/lib*' \
-                                \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) \
-                                2>/dev/null | wc -l)
-              LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
-              AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
+              NEW_COUNT=0
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if grep -qxF "$f" "$SEEN_FILES" 2>/dev/null; then
+                  continue
+                fi
 
-              if [ "$INPUTREADER_SO" -ge 1 ]; then
-                INPUTREADER_SEEN=1
-              fi
+                # 新 so：打印文件本身 + 所在目录全部内容
+                REL="${f#$OUT_DIR/}"
+                SAFE=$(echo "$REL" | tr '/' '_')
+                DIRNAME=$(dirname "$f")
+                SIZE=$(du -h "$f" 2>/dev/null | cut -f1)
+
+                echo ""
+                echo "============================================"
+                echo "[NEW libinput*.so]"
+                echo "  完整路径: $f"
+                echo "  相对路径: $REL"
+                echo "  大小    : $SIZE"
+                echo "  所在目录: $DIRNAME"
+                echo "  --- 该目录下所有文件 ---"
+                ls -la "$DIRNAME" 2>/dev/null | sed 's#^#    #' || echo "    (目录不可读)"
+                echo "============================================"
+                echo ""
+
+                # 记录到 DIRLIST 文件（便于 artifact 里查看）
+                {
+                  echo "============================================"
+                  echo "[$f]"
+                  echo "  dir: $DIRNAME"
+                  echo "  size: $SIZE"
+                  ls -la "$DIRNAME" 2>/dev/null
+                  echo ""
+                } >> "$DIRLIST"
+
+                # 复制 so 到 staging
+                cp -f "$f" "$STAGING/$SAFE" 2>/dev/null || true
+
+                # 记录清单
+                echo "$f|$SAFE|$SIZE" >> "$MANIFEST"
+                echo "$f" >> "$SEEN_FILES"
+                NEW_COUNT=$((NEW_COUNT+1))
+              done < <(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null || true)
+
+              LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
+              AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
 
               if [ "$LIBINPUT_COUNT" -ne "$LAST_LIBINPUT_COUNT" ]; then
                 LAST_LIBINPUT_COUNT=$LIBINPUT_COUNT
                 LAST_CHANGE_TS=$NOW
-                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (数量变化，重置稳定计时)  活跃进程=$ACTIVE_PROCS  磁盘=${AVAIL}MB"
+                echo "[$(date +%T)] 数量变化 → libinput*.so=$LIBINPUT_COUNT (重置稳定计时)  新增=$NEW_COUNT  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
               else
                 STABLE_FOR=$((NOW - LAST_CHANGE_TS))
-                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  活跃进程=$ACTIVE_PROCS  磁盘=${AVAIL}MB"
+                echo "[$(date +%T)] libinput*.so=$LIBINPUT_COUNT (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  新增=$NEW_COUNT  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
 
-                if [ "$INPUTREADER_SEEN" -eq 1 ] && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
-                  echo ">>> libinput*.so 已全部生成并稳定 ${STABLE_FOR}s，终止编译进程组..."
+                if [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
+                  echo ">>> libinput*.so 已稳定 ${STABLE_FOR}s，终止编译..."
+                  STOP_REASON="stable"
                   kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
                   sleep 10
                   kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
@@ -209,12 +263,13 @@ jobs:
                 fi
               fi
             else
-              AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
-              echo "[$(date +%T)] 等待 out/target/product 生成...  活跃进程=$ACTIVE_PROCS  磁盘剩余=${AVAIL}MB"
+              AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
+              echo "[$(date +%T)] 等待 out/target/product 生成...  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
             fi
 
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo ">>> 监控超时，强制终止编译"
+              echo ">>> 监控超时，强制终止"
+              STOP_REASON="timeout"
               kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
               break
             fi
@@ -223,31 +278,47 @@ jobs:
           done
 
           wait "$BUILD_PID" 2>/dev/null || true
+          [ -z "$STOP_REASON" ] && STOP_REASON="process_exit"
 
-          echo ">>> 编译进程已结束，日志尾部："
+          echo ""
+          echo "============================================"
+          echo ">>> 编译结束，停止原因: $STOP_REASON"
+          echo "============================================"
           tail -100 "$LOG" || true
 
+          echo ""
           echo ">>> 最终产物统计："
           OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
           if [ -n "$OUT_DIR" ]; then
             echo "out 目录: $OUT_DIR"
-            echo "libinput*.so 清单:"
-            find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #'
-            echo "libinput*.so 总数: $(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)"
-            echo "InputReader 库:"
-            find "$OUT_DIR" -path '*/lib*' \( -name 'libinputflinger*.so' -o -name 'libinputreader*.so' \) 2>/dev/null | sed 's#^#  #'
+            echo "--- libinput*.so 完整路径 ---"
+            find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #' || echo "  (无)"
+            echo "--- obj/SHARED_LIBRARIES 下的 libinput* ---"
+            find "$OUT_BASE" -path '*SHARED_LIBRARIES*' -name 'libinput*' 2>/dev/null | head -20 | sed 's#^#  #' || true
           else
             echo "未找到 out 目录"
           fi
 
-      - name: 上传编译日志
+          echo ""
+          echo ">>> staging 内容（$STAGING）："
+          ls -la "$STAGING" || true
+          echo ""
+          echo ">>> MANIFEST（原始路径|staging文件名|大小）："
+          cat "$MANIFEST" || true
+
+      # 始终上传：libinput*.so + 清单 + 目录列表 + 日志
+      - name: 上传已发现的 libinput*.so、目录列表和清单（始终执行）
         if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ github.run_id }}
+          name: libinput-so-${{ github.run_id }}-${{ github.event.inputs.BUILD_VARIANT }}
           path: |
+            upload/libinput/*
+            upload/MANIFEST.txt
+            upload/DIRLIST.txt
+            upload/seen.txt
             ~/lineage-16.x-build-gsi/build.log
-            ~/lineage-16.x-build-gsi/out/error.log
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
+          compression-level: 0
