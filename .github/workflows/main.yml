@@ -83,7 +83,7 @@ jobs:
           git config --global user.name "${{ github.actor }}"
           git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-      - name: 编译（发现新 libinput*.so 即暂存并打印目录内容）
+      - name: 编译（定期列出 system/lib 内容；目标 so 齐全且稳定 5 分钟停）
         env:
           BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
@@ -115,7 +115,6 @@ jobs:
           wget -q -O treble_build_los/buildbot_treble.sh \
             https://github.com/amaxsky/los16.0gsi/raw/refs/heads/main/buildbot_treble.sh
           chmod +x treble_build_los/buildbot_treble.sh
-          echo ">>> buildbot_treble.sh 前 10 行:"
           head -10 treble_build_los/buildbot_treble.sh
 
           export BUILD_USERNAME=azure
@@ -126,12 +125,15 @@ jobs:
           STAGING="$GITHUB_WORKSPACE/upload/libinput"
           MANIFEST="$GITHUB_WORKSPACE/upload/MANIFEST.txt"
           DIRLIST="$GITHUB_WORKSPACE/upload/DIRLIST.txt"
+          SYSLIB_SNAPSHOT="$GITHUB_WORKSPACE/upload/SYSLIB_SNAPSHOT.txt"
           mkdir -p "$STAGING"
           : > "$MANIFEST"
           : > "$DIRLIST"
+          : > "$SYSLIB_SNAPSHOT"
           echo "STAGING=$STAGING" >> "$GITHUB_ENV"
           echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
           echo "DIRLIST=$DIRLIST" >> "$GITHUB_ENV"
+          echo "SYSLIB_SNAPSHOT=$SYSLIB_SNAPSHOT" >> "$GITHUB_ENV"
 
           # ===== 后台启动编译 =====
           LOG="$HOME/lineage-16.x-build-gsi/build.log"
@@ -150,7 +152,7 @@ jobs:
           : > "$SEEN_FILES"
           echo "SEEN_FILES=$SEEN_FILES" >> "$GITHUB_ENV"
 
-          echo ">>> 开始监控产物..."
+          echo ">>> 开始监控..."
           while kill -0 "$BUILD_PID" 2>/dev/null; do
             NOW=$(date +%s)
 
@@ -191,21 +193,59 @@ jobs:
               break
             fi
 
-            # 4) 扫描 libinput*.so
+            # 4) 找 out
             OUT_DIR=""
             if [ -d "$OUT_BASE/target/product" ]; then
               OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
             fi
 
             if [ -n "$OUT_DIR" ]; then
+              # 4.1 定期列出 system/lib 和 system/lib64 的内容
+              echo ""
+              echo "==================== $(date +%T) system/lib ===================="
+              if [ -d "$OUT_DIR/system/lib" ]; then
+                ls -la "$OUT_DIR/system/lib" 2>/dev/null | sed 's#^#  #'
+              else
+                echo "  (system/lib 不存在)"
+              fi
+              echo "==================== $(date +%T) system/lib64 ===================="
+              if [ -d "$OUT_DIR/system/lib64" ]; then
+                ls -la "$OUT_DIR/system/lib64" 2>/dev/null | sed 's#^#  #'
+              else
+                echo "  (system/lib64 不存在)"
+              fi
+              echo "==============================================================="
+
+              # 把这次快照追加到文件，方便事后查
+              {
+                echo "===== $(date +%T) system/lib ====="
+                ls -la "$OUT_DIR/system/lib" 2>/dev/null || echo "(不存在)"
+                echo "===== $(date +%T) system/lib64 ====="
+                ls -la "$OUT_DIR/system/lib64" 2>/dev/null || echo "(不存在)"
+                echo ""
+              } >> "$SYSLIB_SNAPSHOT"
+
+              # 4.2 扫描 libinput*.so（排除 vndk，只算 system/lib* 和 vendor/lib*）
+              LIBINPUT_FILES=$(find "$OUT_DIR" \
+                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
+                -name 'libinput*.so' ! -path '*/vndk-*' 2>/dev/null || true)
+              LIBINPUT_COUNT=$(echo "$LIBINPUT_FILES" | grep -c . || true)
+
+              FLINGER=$(find "$OUT_DIR" \
+                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
+                -name 'libinputflinger*.so' ! -path '*/vndk-*' 2>/dev/null | wc -l)
+              SERVICE=$(find "$OUT_DIR" \
+                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
+                -name 'libinputservice*.so' ! -path '*/vndk-*' 2>/dev/null | wc -l)
+
+              AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
+
+              # 发现新文件：打印路径 + 所在目录
               NEW_COUNT=0
               while IFS= read -r f; do
                 [ -z "$f" ] && continue
-                if grep -qxF "$f" "$SEEN_FILES" 2>/dev/null; then
-                  continue
-                fi
+                grep -qxF "$f" "$SEEN_FILES" 2>/dev/null && continue
 
-                # 新 so：打印文件本身 + 所在目录全部内容
                 REL="${f#$OUT_DIR/}"
                 SAFE=$(echo "$REL" | tr '/' '_')
                 DIRNAME=$(dirname "$f")
@@ -223,7 +263,6 @@ jobs:
                 echo "============================================"
                 echo ""
 
-                # 记录到 DIRLIST 文件（便于 artifact 里查看）
                 {
                   echo "============================================"
                   echo "[$f]"
@@ -233,29 +272,26 @@ jobs:
                   echo ""
                 } >> "$DIRLIST"
 
-                # 复制 so 到 staging
                 cp -f "$f" "$STAGING/$SAFE" 2>/dev/null || true
-
-                # 记录清单
                 echo "$f|$SAFE|$SIZE" >> "$MANIFEST"
                 echo "$f" >> "$SEEN_FILES"
                 NEW_COUNT=$((NEW_COUNT+1))
-              done < <(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null || true)
+              done < <(echo "$LIBINPUT_FILES")
 
-              LIBINPUT_COUNT=$(find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | wc -l)
-              AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
-
+              # 数量变化/稳定
               if [ "$LIBINPUT_COUNT" -ne "$LAST_LIBINPUT_COUNT" ]; then
                 LAST_LIBINPUT_COUNT=$LIBINPUT_COUNT
                 LAST_CHANGE_TS=$NOW
-                echo "[$(date +%T)] 数量变化 → libinput*.so=$LIBINPUT_COUNT (重置稳定计时)  新增=$NEW_COUNT  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
+                echo "[$(date +%T)] 数量变化 → libinput*.so=$LIBINPUT_COUNT (flinger=$FLINGER service=$SERVICE) 新增=$NEW_COUNT 活跃=$ACTIVE_PROCS 磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
               else
                 STABLE_FOR=$((NOW - LAST_CHANGE_TS))
-                echo "[$(date +%T)] libinput*.so=$LIBINPUT_COUNT (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  新增=$NEW_COUNT  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
+                echo "[$(date +%T)] libinput*.so=$LIBINPUT_COUNT (flinger=$FLINGER service=$SERVICE) 稳定=${STABLE_FOR}s/${STABLE_SECONDS}s 新增=$NEW_COUNT 活跃=$ACTIVE_PROCS 磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
 
-                if [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
-                  echo ">>> libinput*.so 已稳定 ${STABLE_FOR}s，终止编译..."
-                  STOP_REASON="stable"
+                # 停止条件：flinger 和 service 都已出现在 system/vendor lib 下，且数量稳定满 5 分钟
+                if [ "$FLINGER" -ge 1 ] && [ "$SERVICE" -ge 1 ] \
+                   && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
+                  echo ">>> libinputflinger + libinputservice 已就位且 libinput*.so 稳定 ${STABLE_FOR}s，终止编译..."
+                  STOP_REASON="target_so_ready"
                   kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
                   sleep 10
                   kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
@@ -264,7 +300,7 @@ jobs:
               fi
             else
               AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
-              echo "[$(date +%T)] 等待 out/target/product 生成...  活跃进程=$ACTIVE_PROCS  磁盘剩余=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
+              echo "[$(date +%T)] 等待 out/target/product 生成...  活跃=$ACTIVE_PROCS  磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
             fi
 
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
@@ -291,8 +327,13 @@ jobs:
           OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
           if [ -n "$OUT_DIR" ]; then
             echo "out 目录: $OUT_DIR"
-            echo "--- libinput*.so 完整路径 ---"
-            find "$OUT_DIR" -path '*/lib*' -name 'libinput*.so' 2>/dev/null | sed 's#^#  #' || echo "  (无)"
+            echo "--- system/lib 下的 libinput* ---"
+            ls -la "$OUT_DIR/system/lib" 2>/dev/null | grep -E 'libinput' || echo "  (无)"
+            echo "--- system/lib64 下的 libinput* ---"
+            ls -la "$OUT_DIR/system/lib64" 2>/dev/null | grep -E 'libinput' || echo "  (无)"
+            echo "--- 全路径 libinput*.so（排除 vndk）---"
+            find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
+              -name 'libinput*.so' ! -path '*/vndk-*' 2>/dev/null | sed 's#^#  #' || true
             echo "--- obj/SHARED_LIBRARIES 下的 libinput* ---"
             find "$OUT_BASE" -path '*SHARED_LIBRARIES*' -name 'libinput*' 2>/dev/null | head -20 | sed 's#^#  #' || true
           else
@@ -300,14 +341,10 @@ jobs:
           fi
 
           echo ""
-          echo ">>> staging 内容（$STAGING）："
+          echo ">>> staging 内容："
           ls -la "$STAGING" || true
-          echo ""
-          echo ">>> MANIFEST（原始路径|staging文件名|大小）："
-          cat "$MANIFEST" || true
 
-      # 始终上传：libinput*.so + 清单 + 目录列表 + 日志
-      - name: 上传已发现的 libinput*.so、目录列表和清单（始终执行）
+      - name: 上传产物、清单、system/lib 快照（始终执行）
         if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -317,6 +354,7 @@ jobs:
             upload/libinput/*
             upload/MANIFEST.txt
             upload/DIRLIST.txt
+            upload/SYSLIB_SNAPSHOT.txt
             upload/seen.txt
             ~/lineage-16.x-build-gsi/build.log
           if-no-files-found: warn
