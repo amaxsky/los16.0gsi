@@ -83,7 +83,7 @@ jobs:
           git config --global user.name "${{ github.actor }}"
           git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-      - name: 编译（定期列出 system/lib 内容；目标 so 齐全且稳定 5 分钟停）
+      - name: 编译（检测 obj LINKED 下的 libinputflinger/libinputservice.so）
         env:
           BUILD_VARIANT: ${{ github.event.inputs.BUILD_VARIANT }}
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
@@ -126,14 +126,17 @@ jobs:
           MANIFEST="$GITHUB_WORKSPACE/upload/MANIFEST.txt"
           DIRLIST="$GITHUB_WORKSPACE/upload/DIRLIST.txt"
           SYSLIB_SNAPSHOT="$GITHUB_WORKSPACE/upload/SYSLIB_SNAPSHOT.txt"
+          LINKED_SNAPSHOT="$GITHUB_WORKSPACE/upload/LINKED_SNAPSHOT.txt"
           mkdir -p "$STAGING"
           : > "$MANIFEST"
           : > "$DIRLIST"
           : > "$SYSLIB_SNAPSHOT"
+          : > "$LINKED_SNAPSHOT"
           echo "STAGING=$STAGING" >> "$GITHUB_ENV"
           echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
           echo "DIRLIST=$DIRLIST" >> "$GITHUB_ENV"
           echo "SYSLIB_SNAPSHOT=$SYSLIB_SNAPSHOT" >> "$GITHUB_ENV"
+          echo "LINKED_SNAPSHOT=$LINKED_SNAPSHOT" >> "$GITHUB_ENV"
 
           # ===== 后台启动编译 =====
           LOG="$HOME/lineage-16.x-build-gsi/build.log"
@@ -145,7 +148,7 @@ jobs:
           DEADLINE=$(( $(date +%s) + 1380*60 ))
           OUT_BASE="$HOME/lineage-16.x-build-gsi/out"
 
-          LAST_LIBINPUT_COUNT=-1
+          LAST_COUNT=-1
           LAST_CHANGE_TS=$(date +%s)
           STOP_REASON=""
           SEEN_FILES="$GITHUB_WORKSPACE/upload/seen.txt"
@@ -200,23 +203,14 @@ jobs:
             fi
 
             if [ -n "$OUT_DIR" ]; then
-              # 4.1 定期列出 system/lib 和 system/lib64 的内容
+              # 4.1 定期列出 system/lib 和 system/lib64 内容
               echo ""
               echo "==================== $(date +%T) system/lib ===================="
-              if [ -d "$OUT_DIR/system/lib" ]; then
-                ls -la "$OUT_DIR/system/lib" 2>/dev/null | sed 's#^#  #'
-              else
-                echo "  (system/lib 不存在)"
-              fi
+              [ -d "$OUT_DIR/system/lib" ] && ls -la "$OUT_DIR/system/lib" 2>/dev/null | sed 's#^#  #' || echo "  (不存在)"
               echo "==================== $(date +%T) system/lib64 ===================="
-              if [ -d "$OUT_DIR/system/lib64" ]; then
-                ls -la "$OUT_DIR/system/lib64" 2>/dev/null | sed 's#^#  #'
-              else
-                echo "  (system/lib64 不存在)"
-              fi
+              [ -d "$OUT_DIR/system/lib64" ] && ls -la "$OUT_DIR/system/lib64" 2>/dev/null | sed 's#^#  #' || echo "  (不存在)"
               echo "==============================================================="
 
-              # 把这次快照追加到文件，方便事后查
               {
                 echo "===== $(date +%T) system/lib ====="
                 ls -la "$OUT_DIR/system/lib" 2>/dev/null || echo "(不存在)"
@@ -225,22 +219,19 @@ jobs:
                 echo ""
               } >> "$SYSLIB_SNAPSHOT"
 
-              # 4.2 扫描 libinput*.so（排除 vndk，只算 system/lib* 和 vendor/lib*）
-              LIBINPUT_FILES=$(find "$OUT_DIR" \
-                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
+              # 4.2 检测 obj/SHARED_LIBRARIES 下 LINKED 的 libinputflinger / libinputservice
+              FLINGER_LINKED=$(find "$OUT_BASE" -path '*SHARED_LIBRARIES/libinputflinger_intermediates/LINKED*' -name 'libinputflinger.so' 2>/dev/null | head -1)
+              SERVICE_LINKED=$(find "$OUT_BASE" -path '*SHARED_LIBRARIES/libinputservice_intermediates/LINKED*' -name 'libinputservice.so' 2>/dev/null | head -1)
+
+              # 4.3 扫描所有 obj 下 libinput*.so（用于统计+暂存，排除 vndk）
+              LIBINPUT_FILES=$(find "$OUT_BASE/target/product" \
+                \( -path '*/obj/*' -o -path '*/obj_arm/*' \) \
                 -name 'libinput*.so' ! -path '*/vndk-*' 2>/dev/null || true)
               LIBINPUT_COUNT=$(echo "$LIBINPUT_FILES" | grep -c . || true)
 
-              FLINGER=$(find "$OUT_DIR" \
-                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
-                -name 'libinputflinger*.so' ! -path '*/vndk-*' 2>/dev/null | wc -l)
-              SERVICE=$(find "$OUT_DIR" \
-                \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
-                -name 'libinputservice*.so' ! -path '*/vndk-*' 2>/dev/null | wc -l)
-
               AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
 
-              # 发现新文件：打印路径 + 所在目录
+              # 4.4 新 so：打印路径 + 所在目录
               NEW_COUNT=0
               while IFS= read -r f; do
                 [ -z "$f" ] && continue
@@ -278,20 +269,35 @@ jobs:
                 NEW_COUNT=$((NEW_COUNT+1))
               done < <(echo "$LIBINPUT_FILES")
 
-              # 数量变化/稳定
-              if [ "$LIBINPUT_COUNT" -ne "$LAST_LIBINPUT_COUNT" ]; then
-                LAST_LIBINPUT_COUNT=$LIBINPUT_COUNT
+              # 4.5 打印 LINKED 快照
+              {
+                echo "===== $(date +%T) LINKED ====="
+                echo "FLINGER_LINKED=$FLINGER_LINKED"
+                echo "SERVICE_LINKED=$SERVICE_LINKED"
+                for d in \
+                  "$OUT_DIR/obj/SHARED_LIBRARIES/libinputflinger_intermediates/LINKED" \
+                  "$OUT_DIR/obj/SHARED_LIBRARIES/libinputservice_intermediates/LINKED" \
+                  "$OUT_DIR/obj_arm/SHARED_LIBRARIES/libinputflinger_intermediates/LINKED" \
+                  "$OUT_DIR/obj_arm/SHARED_LIBRARIES/libinputservice_intermediates/LINKED"; do
+                  echo "--- $d ---"
+                  ls -la "$d" 2>/dev/null || echo "(不存在)"
+                done
+                echo ""
+              } >> "$LINKED_SNAPSHOT"
+
+              echo "[$(date +%T)] obj libinput*.so=$LIBINPUT_COUNT  flinger_LINKED=$([ -n "$FLINGER_LINKED" ] && echo 1 || echo 0)  service_LINKED=$([ -n "$SERVICE_LINKED" ] && echo 1 || echo 0)  新增=$NEW_COUNT  活跃=$ACTIVE_PROCS  磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
+
+              # 4.6 数量稳定判定
+              if [ "$LIBINPUT_COUNT" -ne "$LAST_COUNT" ]; then
+                LAST_COUNT=$LIBINPUT_COUNT
                 LAST_CHANGE_TS=$NOW
-                echo "[$(date +%T)] 数量变化 → libinput*.so=$LIBINPUT_COUNT (flinger=$FLINGER service=$SERVICE) 新增=$NEW_COUNT 活跃=$ACTIVE_PROCS 磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
               else
                 STABLE_FOR=$((NOW - LAST_CHANGE_TS))
-                echo "[$(date +%T)] libinput*.so=$LIBINPUT_COUNT (flinger=$FLINGER service=$SERVICE) 稳定=${STABLE_FOR}s/${STABLE_SECONDS}s 新增=$NEW_COUNT 活跃=$ACTIVE_PROCS 磁盘=${DISK_AVAIL_PCT}%/${AVAIL_MB}MB"
-
-                # 停止条件：flinger 和 service 都已出现在 system/vendor lib 下，且数量稳定满 5 分钟
-                if [ "$FLINGER" -ge 1 ] && [ "$SERVICE" -ge 1 ] \
-                   && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
-                  echo ">>> libinputflinger + libinputservice 已就位且 libinput*.so 稳定 ${STABLE_FOR}s，终止编译..."
-                  STOP_REASON="target_so_ready"
+                echo "    (obj libinput*.so 已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)"
+                # 停止条件：flinger 和 service 的 LINKED so 都存在 + 数量稳定满 5 分钟
+                if [ -n "$FLINGER_LINKED" ] && [ -n "$SERVICE_LINKED" ] && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ]; then
+                  echo ">>> libinputflinger.so + libinputservice.so 已链接且 obj libinput*.so 稳定 ${STABLE_FOR}s，终止编译..."
+                  STOP_REASON="target_linked_ready"
                   kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
                   sleep 10
                   kill -KILL -"$BUILD_PID" 2>/dev/null || kill -KILL "$BUILD_PID" 2>/dev/null || true
@@ -327,15 +333,16 @@ jobs:
           OUT_DIR=$(find "$OUT_BASE/target/product" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
           if [ -n "$OUT_DIR" ]; then
             echo "out 目录: $OUT_DIR"
+            echo "--- LINKED libinputflinger.so ---"
+            find "$OUT_BASE" -path '*SHARED_LIBRARIES/libinputflinger_intermediates/LINKED*' -name 'libinputflinger.so' 2>/dev/null | sed 's#^#  #' || echo "  (无)"
+            echo "--- LINKED libinputservice.so ---"
+            find "$OUT_BASE" -path '*SHARED_LIBRARIES/libinputservice_intermediates/LINKED*' -name 'libinputservice.so' 2>/dev/null | sed 's#^#  #' || echo "  (无)"
+            echo "--- obj 下所有 libinput*.so ---"
+            find "$OUT_BASE/target/product" \( -path '*/obj/*' -o -path '*/obj_arm/*' \) -name 'libinput*.so' ! -path '*/vndk-*' 2>/dev/null | sed 's#^#  #' || true
             echo "--- system/lib 下的 libinput* ---"
             ls -la "$OUT_DIR/system/lib" 2>/dev/null | grep -E 'libinput' || echo "  (无)"
             echo "--- system/lib64 下的 libinput* ---"
             ls -la "$OUT_DIR/system/lib64" 2>/dev/null | grep -E 'libinput' || echo "  (无)"
-            echo "--- 全路径 libinput*.so（排除 vndk）---"
-            find "$OUT_DIR" \( -path '*/system/lib/*' -o -path '*/system/lib64/*' -o -path '*/vendor/lib/*' -o -path '*/vendor/lib64/*' \) \
-              -name 'libinput*.so' ! -path '*/vndk-*' 2>/dev/null | sed 's#^#  #' || true
-            echo "--- obj/SHARED_LIBRARIES 下的 libinput* ---"
-            find "$OUT_BASE" -path '*SHARED_LIBRARIES*' -name 'libinput*' 2>/dev/null | head -20 | sed 's#^#  #' || true
           else
             echo "未找到 out 目录"
           fi
@@ -344,7 +351,7 @@ jobs:
           echo ">>> staging 内容："
           ls -la "$STAGING" || true
 
-      - name: 上传产物、清单、system/lib 快照（始终执行）
+      - name: 上传产物、清单、快照（始终执行）
         if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -355,6 +362,7 @@ jobs:
             upload/MANIFEST.txt
             upload/DIRLIST.txt
             upload/SYSLIB_SNAPSHOT.txt
+            upload/LINKED_SNAPSHOT.txt
             upload/seen.txt
             ~/lineage-16.x-build-gsi/build.log
           if-no-files-found: warn
