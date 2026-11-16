@@ -69,7 +69,7 @@ jobs:
             rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
             python2 python3 openjdk-8-jdk openjdk-11-jdk unzip wget aria2 jq
 
-      - name: 强制 python 指向 python2（AOSP 16 必需）
+      - name: 强制 python 指向 python2（LOS16 必需）
         run: |
           mkdir -p ~/.local/bin
           ln -sf /usr/bin/python2 ~/.local/bin/python
@@ -95,7 +95,7 @@ jobs:
           CLEAN_FLAG: ${{ github.event.inputs.CLEAN_BUILD == 'yes' && '--clean' || '' }}
           POLL_INTERVAL: '30'        # 轮询间隔（秒）
           STABLE_SECONDS: '300'      # libinput*.so 数量稳定多久判定"全部生成完"（5 分钟）
-          STALL_SECONDS: '600'       # build.log 超过多久没更新判定卡死（10 分钟）
+          STALL_SECONDS: '1800'      # 日志停滞且无活跃进程多久判定卡死（30 分钟，保守）
         run: |
           set -e
 
@@ -138,7 +138,6 @@ jobs:
           DEADLINE=$(( $(date +%s) + 1380*60 ))
           OUT_BASE="$HOME/lineage-16.x-build-gsi/out"
 
-          # 稳定判定状态
           LAST_LIBINPUT_COUNT=-1
           LAST_CHANGE_TS=$(date +%s)
           INPUTREADER_SEEN=0
@@ -156,10 +155,15 @@ jobs:
               break
             fi
 
-            # 2) 日志停滞检测
+            # 2) 卡死检测：日志停滞 且 无活跃编译进程
             LOG_MTIME=$(stat -c %Y "$LOG" 2>/dev/null || echo "$NOW")
-            if [ $((NOW - LOG_MTIME)) -ge "$STALL_SECONDS" ]; then
-              echo ">>> build.log 已 $((NOW - LOG_MTIME))s 未更新，判定卡死"
+            LOG_STALL=$((NOW - LOG_MTIME))
+
+            ACTIVE_PROCS=$(ps -eo pcpu,comm --no-headers 2>/dev/null | \
+              awk '$1 > 1 && $2 ~ /^(git|repo|make|ninja|soong_ui|python|python2|python3|clang|clang\+\+|cc1|cc1plus|ld|ld\.lld|java|javac|aapt2|d8|r8|gcc|g\+\+)$/ {c++} END {print c+0}')
+
+            if [ "$LOG_STALL" -ge "$STALL_SECONDS" ] && [ "$ACTIVE_PROCS" -eq 0 ]; then
+              echo ">>> build.log 已 ${LOG_STALL}s 未更新，且无活跃编译进程，判定卡死"
               echo "--- 最后 30 行日志 ---"
               tail -30 "$LOG" || true
               echo "--- 相关进程 ---"
@@ -188,16 +192,14 @@ jobs:
                 INPUTREADER_SEEN=1
               fi
 
-              # 数量变化则重置稳定计时
               if [ "$LIBINPUT_COUNT" -ne "$LAST_LIBINPUT_COUNT" ]; then
                 LAST_LIBINPUT_COUNT=$LIBINPUT_COUNT
                 LAST_CHANGE_TS=$NOW
-                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (数量变化，重置稳定计时)  磁盘=${AVAIL}MB"
+                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (数量变化，重置稳定计时)  活跃进程=$ACTIVE_PROCS  磁盘=${AVAIL}MB"
               else
                 STABLE_FOR=$((NOW - LAST_CHANGE_TS))
-                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  磁盘=${AVAIL}MB"
+                echo "[$(date +%T)] out=$OUT_DIR  InputReader库=$INPUTREADER_SO  libinput*.so=$LIBINPUT_COUNT  (已稳定 ${STABLE_FOR}s/${STABLE_SECONDS}s)  活跃进程=$ACTIVE_PROCS  磁盘=${AVAIL}MB"
 
-                # 判定：InputReader 库已出现 且 libinput*.so 数量稳定满 5 分钟
                 if [ "$INPUTREADER_SEEN" -eq 1 ] && [ "$STABLE_FOR" -ge "$STABLE_SECONDS" ] && [ "$LIBINPUT_COUNT" -ge 1 ]; then
                   echo ">>> libinput*.so 已全部生成并稳定 ${STABLE_FOR}s，终止编译进程组..."
                   kill -TERM -"$BUILD_PID" 2>/dev/null || kill -TERM "$BUILD_PID" 2>/dev/null || true
@@ -208,7 +210,7 @@ jobs:
               fi
             else
               AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
-              echo "[$(date +%T)] 等待 out/target/product 生成...  磁盘剩余=${AVAIL}MB"
+              echo "[$(date +%T)] 等待 out/target/product 生成...  活跃进程=$ACTIVE_PROCS  磁盘剩余=${AVAIL}MB"
             fi
 
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
